@@ -1,0 +1,164 @@
+name: "EnigMano Windows RDP (temporary)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      INSTANCE:
+        description: "Instance number (optional)"
+        required: false
+        default: "1"
+
+jobs:
+  setup-windows-rdp:
+    name: "Setup Windows RDP Instance ${{ github.event.inputs.INSTANCE }}"
+    runs-on: windows-2022
+
+    env:
+      INSTANCE_ID: ${{ github.event.inputs.INSTANCE }}
+      NGROK_TOKEN: ${{ secrets.NGROK_TOKEN }}
+      # User credentials requested (hardcoded as you asked)
+      RDP_USER: "amir20120"
+      RDP_PASS: "amiraliA@1"
+      WORKFLOW_FILE: "enigmano-win-rdp.yml"
+      BRANCH: "main"
+
+    steps:
+      - name: Checkout (optional)
+        uses: actions/checkout@v4
+
+      - name: Prepare and run RDP bootstrap script
+        shell: pwsh
+        env:
+          NGROK_TOKEN: ${{ env.NGROK_TOKEN }}
+          RDP_USER: ${{ env.RDP_USER }}
+          RDP_PASS: ${{ env.RDP_PASS }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          function Log($m){ Write-Host "[ENIGMANO] $m" }
+          function Fail($m){ Write-Error "[ENIGMANO-ERROR] $m"; exit 1 }
+
+          # Validate secrets
+          if (-not $env:NGROK_TOKEN) { Fail "Missing secret NGROK_TOKEN. Add it to repository secrets." }
+
+          $user = $env:RDP_USER
+          $passPlain = $env:RDP_PASS
+
+          Log "Step 1 — Enabling RDP, adjusting NLA and firewall"
+          # Enable Remote Desktop
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+          # Disable Network Level Authentication temporarily to avoid 'Securing remote connection' hangs
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 0
+          # Ensure firewall rule exists for 3389
+          if (-not (Get-NetFirewallRule -DisplayName "ENIGMANO RDP IN" -ErrorAction SilentlyContinue)) {
+            New-NetFirewallRule -DisplayName "ENIGMANO RDP IN" -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow
+          } else {
+            Set-NetFirewallRule -DisplayName "ENIGMANO RDP IN" -Enabled True
+          }
+
+          Log "Step 2 — Ensure TermService (RDP service) is running"
+          $term = Get-Service -Name TermService -ErrorAction SilentlyContinue
+          if (-not $term) { Fail "TermService not found on runner." }
+          if ($term.Status -ne 'Running') {
+            Start-Service TermService
+            Start-Sleep -Seconds 3
+            if ((Get-Service TermService).Status -ne 'Running') { Fail "Failed to start TermService." }
+          }
+
+          Log "Step 3 — Create/update local user and add to Remote Desktop Users"
+          try {
+            $exists = Get-LocalUser -Name $user -ErrorAction SilentlyContinue
+            $securePass = ConvertTo-SecureString $passPlain -AsPlainText -Force
+            if (-not $exists) {
+              New-LocalUser -Name $user -Password $securePass -FullName "EnigMano User" -PasswordNeverExpires:$true
+            } else {
+              # update password if exists
+              Set-LocalUser -Name $user -Password $securePass
+            }
+            # Add to Remote Desktop Users
+            try { Add-LocalGroupMember -Group "Remote Desktop Users" -Member $user -ErrorAction SilentlyContinue } catch {}
+          } catch {
+            Fail "User creation/update failed: $_"
+          }
+
+          Log "Step 4 — Download and configure ngrok (v3)"
+          $ngrokZip = "ngrok.zip"
+          $ngrokExe = "ngrok.exe"
+          Remove-Item -Force $ngrokZip, $ngrokExe -ErrorAction SilentlyContinue
+          $ngrokUrl = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
+          try {
+            Invoke-WebRequest -Uri $ngrokUrl -OutFile $ngrokZip -UseBasicParsing -ErrorAction Stop
+            Expand-Archive -Force $ngrokZip -DestinationPath .
+          } catch {
+            Fail "Failed downloading or extracting ngrok: $_"
+          }
+
+          # add authtoken
+          & .\ngrok.exe config add-authtoken $env:NGROK_TOKEN
+
+          Log "Step 5 — Start ngrok tunnel (try multiple regions if needed)"
+          $regions = @("us","eu","ap","au","sa","jp","in")
+          $tunnel = $null
+          foreach ($r in $regions) {
+            Log "Trying region: $r"
+            # stop existing ngrok processes if any
+            Get-Process ngrok -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Process -FilePath .\ngrok.exe -ArgumentList "tcp 3389 --region=$r" -WindowStyle Hidden
+            Start-Sleep -Seconds 6
+
+            # poll local ngrok api
+            for ($i=0; $i -lt 12 -and -not $tunnel; $i++) {
+              try {
+                $resp = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -TimeoutSec 3 -ErrorAction Stop
+                $tunnel = ($resp.tunnels | Where-Object { $_.proto -eq "tcp" } | Select-Object -First 1).public_url
+                if ($tunnel) { break }
+              } catch {
+                Start-Sleep -Seconds 2
+              }
+            }
+            if ($tunnel) { break }
+          }
+
+          if (-not $tunnel) { Fail "Unable to obtain ngrok tunnel after trying regions." }
+
+          # ensure 3389 is listening (may not be instant)
+          $listening = $null
+          for ($i=0; $i -lt 10 -and -not $listening; $i++) {
+            $listening = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
+            if (-not $listening) { Start-Sleep -Seconds 3 }
+          }
+          if (-not $listening) { Log "Warning: port 3389 not observed in Listen state (RDP service may bind later)." }
+
+          $clean = $tunnel -replace '^tcp://',''
+          Write-Host "::notice title=EnigMano RDP Details::Host: $clean`nUser: $user`nPass: $passPlain"
+
+          Log "Step 6 — Polling for successful RDP availability (will wait up to ~2 minutes)"
+          $connected = $false
+          for ($i=0; $i -lt 24 -and -not $connected; $i++) {
+            # attempt a simple TCP connect to host:port to see if remote side accepts connection
+            try {
+              $parts = $clean.Split(":")
+              $host = $parts[0]; $port = [int]$parts[1]
+              $sock = New-Object Net.Sockets.TcpClient
+              $async = $sock.BeginConnect($host, $port, $null, $null)
+              $wait = $async.AsyncWaitHandle.WaitOne(3000)
+              if ($wait -and $sock.Connected) {
+                $sock.Close()
+                $connected = $true
+                break
+              } else {
+                $sock.Close()
+              }
+            } catch {
+              # ignore
+            }
+            Start-Sleep -Seconds 5
+          }
+
+          if (-not $connected) {
+            Log "Notice: Tunnel opened but remote side didn't accept TCP immediately. You can still try connecting via RDP using the printed host:port."
+          } else {
+            Log "Tunnel is accepting TCP connections. Try RDP now using the printed host:port."
+          }
+
+          Log "Done. Runner is ephemeral; session will end when job finishes or runner terminates."
